@@ -1,10 +1,13 @@
 const { Injectable, NotFoundException, BadRequestException } = require('@nestjs/common');
 const { InjectRepository } = require('@nestjs/typeorm');
+const { Inject } = require('@nestjs/common');
 const { Balance } = require('../entities/balance.entity');
+const { HcmService } = require('../hcm/hcm.service');
 
 class BalanceService {
-  constructor(balanceRepo) {
+  constructor(balanceRepo, hcmService) {
     this.balanceRepo = balanceRepo;
+    this.hcmService = hcmService;
   }
 
   async findByEmployee(employeeId) {
@@ -35,17 +38,73 @@ class BalanceService {
     return this.balanceRepo.findOne({ where: { id } });
   }
 
-  // Core validation: does the employee have enough days available?
+  /**
+   * Validate balance — HCM first, fall back to local if HCM is unavailable.
+   */
   async validateSufficientBalance(employeeId, leaveType, requestedDays) {
-    const balance = await this.findByEmployeeAndLeaveType(employeeId, leaveType);
+    let hcmResult = null;
 
-    if (balance.available < requestedDays) {
-      throw new BadRequestException(
-        `Insufficient balance. Requested: ${requestedDays} day(s), Available: ${balance.available} day(s)`,
+    try {
+      hcmResult = await this.hcmService.validateBalance(employeeId, leaveType, requestedDays);
+    } catch (err) {
+      // HCM is unavailable — log and fall back to local check
+      console.warn(
+        `[BalanceService] HCM validation failed for employee ${employeeId}. ` +
+        `Falling back to local balance. Reason: ${err.message}`,
       );
     }
 
-    return balance;
+    if (hcmResult) {
+      // HCM responded — trust it as source of truth
+      if (!hcmResult.valid) {
+        throw new BadRequestException(
+          `HCM validation failed: ${hcmResult.reason}`,
+        );
+      }
+      // HCM says valid — also sync the local balance with what HCM returned
+      await this._syncLocalFromHcm(employeeId, leaveType, hcmResult);
+      return;
+    }
+
+    // HCM fallback — use local balance
+    const balance = await this.findByEmployeeAndLeaveType(employeeId, leaveType);
+    if (balance.available < requestedDays) {
+      throw new BadRequestException(
+        `Insufficient balance (local check). Requested: ${requestedDays}, Available: ${balance.available}`,
+      );
+    }
+  }
+
+  /**
+   * Sync local balance with HCM data if there is a discrepancy.
+   */
+  async _syncLocalFromHcm(employeeId, leaveType, hcmData) {
+    try {
+      const balance = await this.balanceRepo.findOne({
+        where: { employeeId, leaveType },
+      });
+
+      if (!balance) return;
+
+      const localAvailable = parseFloat(balance.available);
+      const hcmAvailable = parseFloat(hcmData.available);
+
+      if (localAvailable !== hcmAvailable) {
+        console.warn(
+          `[BalanceService] Discrepancy detected for employee ${employeeId} ` +
+          `leave type "${leaveType}". Local: ${localAvailable}, HCM: ${hcmAvailable}. ` +
+          `Updating local to match HCM.`,
+        );
+        await this.balanceRepo.update(balance.id, {
+          available: hcmAvailable,
+          used: hcmData.used,
+          lastSyncedAt: new Date(),
+        });
+      }
+    } catch (err) {
+      // Non-critical — just log, don't block the request
+      console.error(`[BalanceService] Failed to sync local balance from HCM: ${err.message}`);
+    }
   }
 
   // Deduct days when a request is approved
@@ -80,7 +139,7 @@ class BalanceService {
 }
 
 Injectable()(BalanceService);
-
 InjectRepository(Balance)(BalanceService, undefined, 0);
+Inject(HcmService)(BalanceService, undefined, 1);
 
 module.exports = { BalanceService };

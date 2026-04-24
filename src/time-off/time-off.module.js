@@ -5,6 +5,7 @@ const { TimeOffService } = require('./time-off.service');
 const { BalanceModule } = require('../balance/balance.module');
 const { EmployeeModule } = require('../employee/employee.module');
 const { TimeOffController } = require('./time-off.controller');
+const { HcmModule } = require('../hcm/hcm.module');
 
 class TimeOffModule { }
 
@@ -13,6 +14,7 @@ Module({
     TypeOrmModule.forFeature([TimeOffRequest]),
     BalanceModule,   // gives us BalanceService
     EmployeeModule,  // gives us EmployeeService
+    HcmModule,  // gives us HcmService
   ],
   controllers: [TimeOffController],
   providers: [TimeOffService],
